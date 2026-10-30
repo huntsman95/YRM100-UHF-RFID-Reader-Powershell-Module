@@ -147,6 +147,149 @@ function Get-YRM100Info {
     [pscustomobject]@{ Kind=$Kind; Value=[Text.Encoding]::ASCII.GetString($reply.Data,1,$reply.Data.Length-1).TrimEnd([char]0) }
 }
 
+function Get-YRM100Region {
+    <# .SYNOPSIS
+    Queries the reader's configured RF region without changing it.
+    .DESCRIPTION
+    Returns RegionCode and Region. Unrecognized firmware codes return Unknown
+    with the original numeric code preserved.
+    .EXAMPLE
+    Get-YRM100Region -Connection $reader
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)]$Connection)
+    $reply=Invoke-YRM100Command $Connection 0x08
+    if ($reply.Type -ne 1 -or $reply.Data.Length -ne 1) { throw 'Malformed RF region response: expected one data byte in a response frame.' }
+    $code=[int]$reply.Data[0]
+    $regions=@{ 1='China 900 MHz'; 2='America'; 3='Europe'; 4='China 800 MHz'; 6='South Korea' }
+    $name='Unknown'
+    if ($regions.ContainsKey($code)) { $name=$regions[$code] }
+    [pscustomobject]@{ RegionCode=$code; Region=$name }
+}
+
+function Get-YRM100OutputPower {
+    <# .SYNOPSIS
+    Queries the reader's configured RF output power without changing it.
+    .DESCRIPTION
+    Returns OutputPowerdBm and the protocol's raw hundredths-of-dBm value.
+    This is configured transmit power, not tag RSSI or a measured radiated power.
+    .EXAMPLE
+    Get-YRM100OutputPower -Connection $reader
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)]$Connection)
+    $reply=Invoke-YRM100Command $Connection 0xB7
+    if ($reply.Type -ne 1 -or $reply.Data.Length -ne 2) { throw 'Malformed RF output power response: expected two data bytes in a response frame.' }
+    $raw=[int]$reply.Data[0]*256+[int]$reply.Data[1]
+    [pscustomobject]@{ OutputPowerdBm=$raw/100.0; RawPower=$raw }
+}
+
+function Set-YRM100Region {
+    <# .SYNOPSIS
+    Sets the reader's RF region by name or protocol code.
+    .DESCRIPTION
+    Supports -WhatIf and -Confirm. Use -PassThru to query the resulting setting.
+    Region names: China900, America, Europe, China800, SouthKorea.
+    .EXAMPLE
+    Set-YRM100Region $reader -Region America -PassThru
+    .EXAMPLE
+    Set-YRM100Region $reader -RegionCode 2 -WhatIf
+    #>
+    [CmdletBinding(SupportsShouldProcess,DefaultParameterSetName='Name')] param(
+        [Parameter(Mandatory,Position=0)]$Connection,
+        [Parameter(Mandatory,ParameterSetName='Name')]
+        [ValidateSet('China900','America','Europe','China800','SouthKorea')][string]$Region,
+        [Parameter(Mandatory,ParameterSetName='Code')]
+        [ValidateSet(1,2,3,4,6)][byte]$RegionCode,
+        [switch]$PassThru
+    )
+    $code=$RegionCode
+    if ($PSCmdlet.ParameterSetName -eq 'Name') {
+        $code=[byte]@{China900=1;America=2;Europe=3;China800=4;SouthKorea=6}[$Region]
+    }
+    if (-not $PSCmdlet.ShouldProcess($Connection.Port.PortName,"Set RF region to code $code")) { return }
+    [Threading.Monitor]::Enter($Connection.SyncRoot)
+    try {
+        Assert-YRMStatus (Invoke-YRM100Command $Connection 0x07 ([byte[]]@($code)))
+        if ($PassThru) { Get-YRM100Region $Connection }
+    } finally { [Threading.Monitor]::Exit($Connection.SyncRoot) }
+}
+
+function Set-YRM100OutputPower {
+    <# .SYNOPSIS
+    Sets configured transmit power in dBm (0 to 26, hundredth-dBm precision).
+    .DESCRIPTION
+    Uses the 26 dBm ceiling of the supported reader. Firmware may impose a
+    narrower range or coarser steps. Use -PassThru to query the resulting value.
+    Supports -WhatIf and -Confirm. Does not change received tag RSSI directly.
+    .EXAMPLE
+    Set-YRM100OutputPower $reader -OutputPowerdBm 20 -PassThru
+    #>
+    [CmdletBinding(SupportsShouldProcess)] param(
+        [Parameter(Mandatory)]$Connection,
+        [Parameter(Mandatory)][Alias('PowerdBm')]
+        [ValidateRange(0,26)][decimal]$OutputPowerdBm,
+        [switch]$PassThru
+    )
+    $scaled=$OutputPowerdBm*100
+    if ($scaled -ne [decimal]::Truncate($scaled)) { throw 'OutputPowerdBm must have at most two decimal places.' }
+    $raw=[uint16]$scaled
+    if (-not $PSCmdlet.ShouldProcess($Connection.Port.PortName,"Set RF output power to $OutputPowerdBm dBm")) { return }
+    [Threading.Monitor]::Enter($Connection.SyncRoot)
+    try {
+        Assert-YRMStatus (Invoke-YRM100Command $Connection 0xB6 (Get-YRMBigEndian $raw 2))
+        if ($PassThru) { Get-YRM100OutputPower $Connection }
+    } finally { [Threading.Monitor]::Exit($Connection.SyncRoot) }
+}
+
+function Get-YRM100OperatingChannel {
+    <# .SYNOPSIS
+    Queries the operating channel index and derives its frequency from the region.
+    .DESCRIPTION
+    Returns ChannelIndex, RegionCode, Region, and FrequencyMHz. Frequency is null
+    for unknown regions. Frequency is calculated, not measured; automatic hopping
+    can change the operating channel. Does not change hopping or region settings.
+    .EXAMPLE
+    Get-YRM100OperatingChannel $reader
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)]$Connection)
+    [Threading.Monitor]::Enter($Connection.SyncRoot)
+    try {
+        $reply=Invoke-YRM100Command $Connection 0xAA
+        if ($reply.Type -ne 1 -or $reply.Data.Length -ne 1) { throw 'Malformed operating channel response: expected one data byte in a response frame.' }
+        $index=[int]$reply.Data[0]
+        $region=Get-YRM100Region $Connection
+        $plans=@{1=@(920.125,0.25);2=@(902.25,0.5);3=@(865.1,0.2);4=@(840.125,0.25);6=@(917.1,0.2)}
+        $frequency=$null
+        if ($plans.ContainsKey($region.RegionCode)) {
+            $plan=$plans[$region.RegionCode]
+            $frequency=[Math]::Round($plan[0]+$index*$plan[1],3)
+        }
+        [pscustomobject]@{ ChannelIndex=$index; RegionCode=$region.RegionCode; Region=$region.Region; FrequencyMHz=$frequency }
+    } finally { [Threading.Monitor]::Exit($Connection.SyncRoot) }
+}
+
+function Set-YRM100OperatingChannel {
+    <# .SYNOPSIS
+    Sets the operating channel by zero-based protocol index.
+    .DESCRIPTION
+    Supports -WhatIf, -Confirm, and -PassThru readback. Index must fit a byte;
+    firmware validates which indices are supported for the configured region.
+    Does not disable automatic frequency hopping or change the region.
+    .EXAMPLE
+    Set-YRM100OperatingChannel $reader -ChannelIndex 1 -PassThru
+    #>
+    [CmdletBinding(SupportsShouldProcess)] param(
+        [Parameter(Mandatory,Position=0)]$Connection,
+        [Parameter(Mandatory)][ValidateRange(0,255)][int]$ChannelIndex,
+        [switch]$PassThru
+    )
+    if (-not $PSCmdlet.ShouldProcess($Connection.Port.PortName,"Set operating channel index to $ChannelIndex")) { return }
+    [Threading.Monitor]::Enter($Connection.SyncRoot)
+    try {
+        Assert-YRMStatus (Invoke-YRM100Command $Connection 0xAB ([byte[]]@($ChannelIndex)))
+        if ($PassThru) { Get-YRM100OperatingChannel $Connection }
+    } finally { [Threading.Monitor]::Exit($Connection.SyncRoot) }
+}
+
 function Get-YRM100Tag {
     <# .SYNOPSIS
     Performs one inventory poll and returns the first reported tag.
@@ -300,4 +443,4 @@ function Write-YRM100Memory {
     } finally { [Threading.Monitor]::Exit($Connection.SyncRoot) }
 }
 
-Export-ModuleMember -Function Get-YRM100Port,Connect-YRM100,Disconnect-YRM100,Get-YRM100Info,Get-YRM100Tag,Get-YRM100Tags,Read-YRM100Memory,Write-YRM100Memory,Invoke-YRM100Command
+Export-ModuleMember -Function Get-YRM100Port,Connect-YRM100,Disconnect-YRM100,Get-YRM100Info,Get-YRM100Region,Get-YRM100OutputPower,Set-YRM100Region,Set-YRM100OutputPower,Get-YRM100OperatingChannel,Set-YRM100OperatingChannel,Get-YRM100Tag,Get-YRM100Tags,Read-YRM100Memory,Write-YRM100Memory,Invoke-YRM100Command

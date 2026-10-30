@@ -41,6 +41,12 @@ For installation, copy the `YRM100` directory into a directory listed in
 | `Connect-YRM100` | Open a configurable serial connection |
 | `Disconnect-YRM100` | Release the port |
 | `Get-YRM100Info` | Read hardware, software, or manufacturer identification |
+| `Get-YRM100Region` | Query the configured RF region code and name |
+| `Get-YRM100OutputPower` | Query configured transmit power in dBm and raw hundredths of dBm |
+| `Set-YRM100Region` | Set region by name or code; supports `-WhatIf`, `-Confirm`, and `-PassThru` |
+| `Set-YRM100OutputPower` | Set transmit power in dBm; supports `-WhatIf`, `-Confirm`, and `-PassThru` |
+| `Get-YRM100OperatingChannel` | Query channel index and calculate frequency from the current region |
+| `Set-YRM100OperatingChannel` | Set a channel index; supports `-WhatIf`, `-Confirm`, and `-PassThru` |
 | `Get-YRM100Tag` | One inventory poll, returning the first reported EPC, signed RSSI, PC, CRC, and timestamp |
 | `Get-YRM100Tags` | Timed multiple inventory, returning one result per observed EPC with read counts and signal statistics |
 | `Read-YRM100Memory` | Select an EPC and read a memory bank |
@@ -50,6 +56,98 @@ For installation, copy the `YRM100` directory into a directory listed in
 Use `Get-Help <command> -Full` for parameter help. Pass the returned connection
 object explicitly; multiple readers can have independent connections. Dispose
 each connection in `finally`. Module removal does not close connection objects.
+
+## Query RF configuration
+
+```powershell
+$reader = Connect-YRM100 COM9
+try {
+    Get-YRM100Region $reader
+    Get-YRM100OutputPower $reader
+} finally {
+    Disconnect-YRM100 $reader
+}
+```
+
+Both queries are read-only. Region results contain `RegionCode` and `Region`:
+1 = China 900 MHz, 2 = America, 3 = Europe, 4 = China 800 MHz,
+6 = South Korea. Unknown codes are preserved with the name `Unknown`.
+Power results contain `OutputPowerdBm` and `RawPower` (hundredths of a dBm).
+Configured output power is distinct from received tag RSSI and does not measure
+radiated power. On COM9, verification returned region 1 (China 900 MHz) and
+26 dBm (raw 2600); neither setting was changed.
+
+## Set RF configuration
+
+```powershell
+$reader = Connect-YRM100 COM9
+try {
+    Set-YRM100Region $reader -Region America -WhatIf
+    Set-YRM100OutputPower $reader -OutputPowerdBm 20 -WhatIf
+
+    # Remove -WhatIf to apply settings; -PassThru queries the resulting value.
+    # Set-YRM100Region $reader -Region America -PassThru
+    # Set-YRM100OutputPower $reader -OutputPowerdBm 20 -PassThru
+} finally {
+    Disconnect-YRM100 $reader
+}
+```
+
+Region names are `China900`, `America`, `Europe`, `China800`, and `SouthKorea`.
+Alternatively use `-RegionCode` with 1, 2, 3, 4, or 6 respectively. Choose either
+name or code, not both. Output power accepts 0–26 dBm with at most two decimal
+places (`-PowerdBm` is an alias for `-OutputPowerdBm`). The module uses the
+26 dBm ceiling of the tested reader; firmware may reject lower settings or
+quantize values to its supported steps. Zero dBm does not turn RF off.
+
+Setters require a successful status reply and return no objects by default.
+`-PassThru` performs a subsequent query and returns the actual reported setting.
+If that query fails, the setting may already have been applied. No automatic
+retry or rollback occurs. `-WhatIf` performs no serial I/O. Settings take effect
+on the reader; persistence across power cycles is firmware-dependent. The setters
+do not alter channel or frequency-hopping configuration. Setter tests use simulated
+responses; the attached reader's configuration was not changed during validation.
+
+## Operating channel
+
+```powershell
+Import-Module .\YRM100\YRM100.psd1 -Force
+$reader = Connect-YRM100 COM9
+try {
+    Get-YRM100OperatingChannel $reader
+    Set-YRM100OperatingChannel $reader -ChannelIndex 1 -WhatIf
+    # Apply and query the resulting channel:
+    # Set-YRM100OperatingChannel $reader -ChannelIndex 1 -PassThru
+} finally {
+    Disconnect-YRM100 $reader
+}
+```
+
+The index is zero-based, not a frequency in MHz. `Get-YRM100OperatingChannel`
+queries both channel and region, returning `ChannelIndex`, `RegionCode`, `Region`,
+and `FrequencyMHz`. Frequency is calculated using the protocol's region plan:
+
+| Region | Frequency in MHz |
+| --- | --- |
+| China 900 MHz | 920.125 + index × 0.25 |
+| America | 902.25 + index × 0.5 |
+| Europe | 865.1 + index × 0.2 |
+| China 800 MHz | 840.125 + index × 0.25 |
+| South Korea | 917.1 + index × 0.2 |
+
+Unknown region codes return a null frequency. The setter accepts a protocol byte
+index (0–255); firmware validates the supported indices for the active region.
+This byte range does not mean every index is usable in every region. It requires
+a successful status reply and returns no objects unless `-PassThru` is specified.
+If readback fails, the setting may already have been applied.
+
+Neither command changes region or automatic frequency hopping. When hopping is
+enabled, the channel can change after querying or setting it; calculated frequency
+is not a measured or guaranteed fixed transmit frequency. Persistence across
+power cycles depends on firmware. Hardware verification on 2026-10-30 using COM9
+successfully queried the America region channel, changed index 16 (910.25 MHz)
+to index 20 (912.25 MHz), verified the result, then restored index 16 and verified
+the restoration. The serial connection was closed afterward.
 
 ## Scan for multiple tags
 
@@ -113,9 +211,8 @@ tags sharing that EPC cannot be distinguished by this mask.
 ## Advanced commands and limitations
 
 ```powershell
-# Read current RF output power (hundredths of a dBm).
-$reply = Invoke-YRM100Command $reader -Command 0xB7
-($reply.Data[0] * 256 + $reply.Data[1]) / 100
+# Read current RF output power using the dedicated query command.
+Get-YRM100OutputPower $reader
 ```
 
 Advanced commands can change reader settings or tag contents; consult the
@@ -155,6 +252,13 @@ checksums, timeouts, and disposal. They never open a real port.
 Multiple-inventory tests also cover deduplication, signal aggregation, empty scans,
 and stopping after a malformed frame. A three-second hardware scan on COM9
 detected three unique EPCs and successfully returned to request/response mode.
+RF-query tests cover exact command bytes, all documented region codes, unknown
+codes, integer and fractional output power, malformed payloads, and reader errors.
+RF-setter tests cover region mappings, exact power encoding, bounds and precision,
+readback, `-WhatIf`, invalid status responses, and reader errors.
+Channel tests cover command bytes, region frequency formulas, unknown regions,
+readback, byte boundaries, invalid indices, `-WhatIf`, malformed responses, and
+reader errors.
 
 Hardware verification on 2026-10-30, COM9 at 115200 baud: identification returned
 `M100 26dBm V2.01`, software `V2.4.9`, manufacturer `MagicRf`. Inventory returned
